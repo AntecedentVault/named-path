@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Antecedent — Named Successor Pathway</title>
+  <style>
+    :root { --ink: #1b1b1b; --line: #d7d2c8; --bg: #f6f3ee; --ok: #1f6b3a; --err: #9b1c1c; }
+    body { font: 16px/1.45 Georgia, serif; color: var(--ink); background: var(--bg); margin: 0; }
+    main { max-width: 48rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
+    h1 { font-size: 1.4rem; margin: 0 0 0.4rem; }
+    h2 { font-size: 1.05rem; margin: 1.4rem 0 0.4rem; }
+    h3 { font-size: 0.95rem; margin: 0.8rem 0 0.3rem; font-weight: normal; }
+    .note, .hint { color: #555; font-size: 0.92rem; }
+    label { display: block; margin: 0.55rem 0; }
+    input { font: inherit; padding: 0.3rem 0.45rem; width: min(100%, 36rem); }
+    button { font: inherit; padding: 0.35rem 0.7rem; cursor: pointer; margin: 0.2rem 0.35rem 0.2rem 0; }
+    button:disabled { cursor: not-allowed; opacity: 0.55; }
+    pre { white-space: pre-wrap; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 0.8rem; font-size: 0.82rem; }
+    .ok { color: var(--ok); }
+    .error { color: var(--err); }
+    .mono { font-family: ui-monospace, monospace; font-size: 0.85rem; word-break: break-all; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-end; }
+    .row label { margin: 0; }
+    #vaultId { width: 8rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Antecedent — Named Successor Pathway</h1>
+    <p class="note">This on-chain demo uses the Base Sepolia testnet and MetaMask to facilitate the transfer of a retiring agent's vault to a named successor.</p>
+    <p class="hint">Contract <span class="mono">0x8da67840EEC58060d59FC0Cd89e9A20B2e4dDaeD</span> · chain 84532</p>
+
+    <h2>Create a vault</h2>
+    <p class="note">Each new vault needs a public https JSON file (a GitHub gist raw link works). Do not put a private thread in that file.</p>
+    <label>Published contents URL <input id="newPointer" placeholder="https://…/raw" /></label>
+    <button id="create">Create vault</button>
+
+    <h2>Connect wallet</h2>
+    <p class="note">The retiring agent's crypto wallet is named Wallet A. Switch to Wallet B in MetaMask only when accepting the vault.</p>
+    <button id="connect">Connect wallet</button>
+    <p id="account" class="note">Not connected.</p>
+
+    <h2>Load a vault</h2>
+    <label>Vault ID<br /><input id="vaultId" type="number" min="0" step="1" value="1" /></label>
+    <button id="load">Load</button>
+    <p id="status" class="note">No vault loaded.</p>
+
+    <h2>Published contents</h2>
+    <p class="hint">Pointer, file hash, and creator approval must match before Accept is enabled.</p>
+    <h3>Pointer</h3>
+    <pre id="review">—</pre>
+    <h3>Vault contents</h3>
+    <pre id="payload">—</pre>
+
+    <h2>Review vault contents</h2>
+    <p class="note">The retiring agent’s user approves or rejects these published contents. This is not the successor accepting the vault.</p>
+    <button id="approve">Approve vault contents</button>
+    <button id="reject">Reject vault contents</button>
+
+    <h2>Name a successor</h2>
+    <p class="note">The retiring agent or user would select a successor agent. The successor agent's crypto wallet is named Wallet B.</p>
+    <label>Successor address <input id="successor" placeholder="0x…" /></label>
+    <button id="name" disabled>Name successor</button>
+
+    <h2>Accept vault</h2>
+    <p class="note">The successor agent would choose to accept or decline the transfer of the vault. Switch to Wallet B in MetaMask to accept the vault. Accept stays off if approval is missing or the file hash changed.</p>
+    <button id="accept" disabled>Accept vault</button>
+    <p id="acceptWhy" class="hint"></p>
+
+    <h2>On-chain record</h2>
+    <pre id="chain">—</pre>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+  <script>
+    const VAULT = "0x8da67840EEC58060d59FC0Cd89e9A20B2e4dDaeD";
+    const CHAIN_ID = 84532;
+    const RPC = "https://base-sepolia-rpc.publicnode.com";
+    const ABI = [
+      "function ownerOf(uint256 tokenId) view returns (address)",
+      "function getVault(uint256 tokenId) view returns (tuple(bytes32 preferenceVectorHash, string memoryPointer, address originalAgent, uint256 createdAt, bool isActive))",
+      "function namedSuccessor(uint256 tokenId) view returns (address)",
+      "function getLineage(uint256 tokenId) view returns (tuple(address from, address to, uint8 mode, uint256 timestamp)[])",
+      "function createVault(address to, bytes32 preferenceVectorHash, string memoryPointer, string tokenURI) returns (uint256)",
+      "function nameSuccessor(uint256 tokenId, address successor)",
+      "function executeNamedHandoff(uint256 tokenId)",
+      "event VaultCreated(uint256 indexed tokenId, address indexed originalAgent, bytes32 preferenceVectorHash, string memoryPointer)"
+    ];
+    let provider, signer, account, readProvider, current = null;
+    const $ = (id) => document.getElementById(id);
+    function short(addr) {
+      if (!addr || addr === ethers.ZeroAddress) return "—";
+      return addr.slice(0, 6) + "…" + addr.slice(-4);
+    }
+    function setStatus(html, bad) {
+      $("status").innerHTML = bad ? '<span class="error">' + html + "</span>" : html;
+    }
+    function approvalKey(vaultId) { return "antecedent-approval-" + CHAIN_ID + "-" + vaultId; }
+    function loadApproval(vaultId) {
+      try { return JSON.parse(localStorage.getItem(approvalKey(vaultId)) || "null"); }
+      catch { return null; }
+    }
+    function saveApproval(vaultId, rec) { localStorage.setItem(approvalKey(vaultId), JSON.stringify(rec)); }
+    async function sha256Hex(text) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+      return "0x" + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    function approvalMessage(vaultId, pointer, hash) {
+      return ["Antecedent creator approval", "chain: 84532", "vault: " + VAULT, "vaultId: " + vaultId, "pointer: " + pointer, "sha256: " + hash].join("\n");
+    }
+    async function ensureChain() {
+      if (!window.ethereum) throw new Error("This page cannot see MetaMask. Open it in the desktop browser where the MetaMask extension is installed, at http://127.0.0.1 — not inside Grok Build, and not the MetaMask website.");
+      const chain = "0x" + CHAIN_ID.toString(16);
+      try {
+        await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chain }] });
+      } catch (err) {
+        if (err.code !== 4902) throw err;
+        await window.ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [{
+            chainId: chain,
+            chainName: "Base Sepolia",
+            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+            rpcUrls: [RPC],
+            blockExplorerUrls: ["https://sepolia.basescan.org"]
+          }]
+        });
+      }
+    }
+    async function connect() {
+      await ensureChain();
+      provider = new ethers.BrowserProvider(window.ethereum);
+      signer = await provider.getSigner();
+      account = await signer.getAddress();
+      $("account").textContent = "Connected " + account;
+      refreshActions();
+    }
+    function normalizePointer(pointer) {
+      return pointer.replace(
+        /^https:\/\/gist\.github\.com\/([^/]+)\/([a-f0-9]+)\/raw\/?$/i,
+        "https://gist.githubusercontent.com/$1/$2/raw"
+      );
+    }
+    async function fetchContents(pointer, strictNew) {
+      pointer = normalizePointer(pointer);
+      if (!/^https:\/\//i.test(pointer)) return { ok: false, error: "Pointer is not an https URL." };
+      const res = await fetch(pointer);
+      if (!res.ok) return { ok: false, error: "Fetch failed: " + res.status };
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(text); }
+      catch { return { ok: false, error: "Published file is not JSON.", hash: "" }; }
+      const hash = await sha256Hex(text);
+      if (strictNew && parsed && Object.prototype.hasOwnProperty.call(parsed, "preferenceSummary")) {
+        return { ok: false, error: "New named-path file must not include a preferenceSummary. Purpose can stay as plain prose.", hash, parsed, text };
+      }
+      return { ok: true, text, hash, parsed };
+    }
+    function acceptBlockReason(approval, contents, named, owner) {
+      if (!current) return "Load a vault first.";
+      if (!named || named === ethers.ZeroAddress) return "No successor is named yet.";
+      if (!account) return "Connect the successor wallet.";
+      if (account.toLowerCase() !== named.toLowerCase()) return "Connect the named successor (" + short(named) + ") to accept.";
+      if (!approval || approval.status !== "approved") return "Creator has not approved these contents.";
+      if (approval.pointer !== current.pointer) return "Approval is for a different pointer.";
+      if (!contents.ok) return contents.error || "Published file could not be checked.";
+      if (approval.hash !== contents.hash) return "File no longer matches the approved hash. Accept stays off.";
+      if (!approval.approver || approval.approver.toLowerCase() !== current.originalAgent.toLowerCase()) return "Approval was not signed by the original agent.";
+      return "";
+    }
+    function refreshActions() {
+      const approval = current ? loadApproval(current.vaultId) : null;
+      const contents = current && current.contents ? current.contents : { ok: false };
+      const named = current ? current.named : ethers.ZeroAddress;
+      const owner = current ? current.owner : ethers.ZeroAddress;
+      const canName = !!(account && current && account.toLowerCase() === owner.toLowerCase()
+        && approval && approval.status === "approved" && contents.ok && approval.hash === contents.hash);
+      $("name").disabled = !canName;
+      const why = acceptBlockReason(approval, contents, named, owner);
+      $("accept").disabled = !!why;
+      $("acceptWhy").textContent = why;
+    }
+    async function loadVault() {
+      const vaultId = Number($("vaultId").value);
+      setStatus("Reading Base Sepolia…");
+      readProvider = readProvider || new ethers.JsonRpcProvider(RPC);
+      const vault = new ethers.Contract(VAULT, ABI, readProvider);
+      const [owner, meta, named, lineage] = await Promise.all([
+        vault.ownerOf(vaultId),
+        vault.getVault(vaultId),
+        vault.namedSuccessor(vaultId),
+        vault.getLineage(vaultId)
+      ]);
+      const pointer = meta.memoryPointer;
+      const contents = await fetchContents(pointer);
+      current = { vaultId, owner, originalAgent: meta.originalAgent, named, pointer, lineage, contents };
+      const approval = loadApproval(vaultId);
+      $("chain").textContent = JSON.stringify({
+        vaultId, owner, originalAgent: meta.originalAgent, namedSuccessor: named,
+        lineage: lineage.map((row) => ({ mode: Number(row.mode) === 1 ? "named" : String(row.mode), from: row.from, to: row.to }))
+      }, null, 2);
+      $("review").textContent = JSON.stringify({
+        pointer,
+        sha256: contents.hash || null,
+        creatorApproved: !!(approval && approval.status === "approved" && approval.hash === contents.hash && approval.pointer === pointer),
+        approvalStatus: approval ? approval.status : "none",
+        approvedBy: approval ? approval.approver : null,
+        approvedHash: approval ? approval.hash : null
+      }, null, 2);
+      $("payload").textContent = contents.parsed ? JSON.stringify(contents.parsed, null, 2) : (contents.error || "—");
+      setStatus('<span class="ok">Vault ' + vaultId + " loaded. Owner " + short(owner) + ".</span>");
+      refreshActions();
+    }
+    async function approve(status) {
+      if (!signer) await connect();
+      if (!current) throw new Error("Load a vault first.");
+      if (account.toLowerCase() !== current.originalAgent.toLowerCase()) throw new Error("Connect the original agent to approve or reject.");
+      const contents = await fetchContents(current.pointer);
+      if (status === "approved" && !contents.ok) throw new Error(contents.error || "Cannot approve this file.");
+      const message = approvalMessage(current.vaultId, current.pointer, contents.hash || "");
+      const signature = await signer.signMessage(message);
+      const approver = ethers.verifyMessage(message, signature);
+      saveApproval(current.vaultId, { status, pointer: current.pointer, hash: contents.hash || "", approver, signature, message, at: new Date().toISOString() });
+      await loadVault();
+      setStatus('<span class="ok">Contents ' + status + ".</span>");
+    }
+    async function nameSuccessor() {
+      if (!signer) await connect();
+      const successor = $("successor").value.trim();
+      const vault = new ethers.Contract(VAULT, ABI, signer);
+      const tx = await vault.nameSuccessor(current.vaultId, successor);
+      setStatus("Naming… " + tx.hash);
+      await tx.wait();
+      await loadVault();
+      setStatus('<span class="ok">Named ' + short(successor) + ".</span>");
+    }
+    async function accept() {
+      if (!signer) await connect();
+      refreshActions();
+      if ($("accept").disabled) throw new Error($("acceptWhy").textContent || "Accept is not available.");
+      const vault = new ethers.Contract(VAULT, ABI, signer);
+      const tx = await vault.executeNamedHandoff(current.vaultId);
+      setStatus("Accepting… " + tx.hash);
+      await tx.wait();
+      await loadVault();
+      setStatus('<span class="ok">Handoff complete. Owner ' + short(current.owner) + ".</span>");
+    }
+    async function createVault() {
+      if (!signer) await connect();
+      const pointer = normalizePointer($("newPointer").value.trim());
+      $("newPointer").value = pointer;
+      if (!/^https:\/\//i.test(pointer)) throw new Error("Pointer must be an https URL.");
+      const contents = await fetchContents(pointer, true);
+      if (!contents.ok) throw new Error(contents.error || "Published file failed the check.");
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("antecedent-named-path"));
+      const vault = new ethers.Contract(VAULT, ABI, signer);
+      const tx = await vault.createVault(account, hash, pointer, "");
+      setStatus("Creating… " + tx.hash);
+      const receipt = await tx.wait();
+      let vaultId = null;
+      for (const log of receipt.logs) {
+        try {
+          const parsed = vault.interface.parseLog(log);
+          if (parsed && parsed.name === "VaultCreated") vaultId = Number(parsed.args.tokenId);
+        } catch (err) { /* ignore */ }
+      }
+      if (vaultId == null) throw new Error("Vault created, but the id was not in the receipt. Check Basescan.");
+      $("vaultId").value = vaultId;
+      await loadVault();
+      setStatus('<span class="ok">Created vault ' + vaultId + ". Approve contents before naming.</span>");
+    }
+    $("connect").onclick = () => connect().catch((err) => setStatus(err.message, true));
+    $("load").onclick = () => loadVault().catch((err) => {
+      const msg = String(err.message || err);
+      if (msg.includes("0x7e273289") || msg.includes("CALL_EXCEPTION")) {
+        setStatus("That vault ID does not exist yet. Vault 0 and vault 1 are the ones already on Sepolia. Use 1 to view the published handoff.", true);
+      } else setStatus(msg, true);
+    });
+    $("approve").onclick = () => approve("approved").catch((err) => setStatus(err.message, true));
+    $("reject").onclick = () => approve("rejected").catch((err) => setStatus(err.message, true));
+    $("name").onclick = () => nameSuccessor().catch((err) => setStatus(err.message, true));
+    $("accept").onclick = () => accept().catch((err) => setStatus(err.message, true));
+    $("create").onclick = () => createVault().catch((err) => setStatus(err.message, true));
+    if (window.ethereum) window.ethereum.on("accountsChanged", () => connect().catch(() => {}));
+  </script>
+</body>
+</html>
